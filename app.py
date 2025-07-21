@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["https://dnx.bedouiadem.tech"])
 
 def clean_domain(domain: str) -> str:
     """Clean and normalize domain name."""
