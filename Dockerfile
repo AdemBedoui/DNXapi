@@ -5,12 +5,17 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Installer whois et utilitaires DNS
+# Installer locales, whois et utilitaires DNS
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+      locales \
       whois \
       dnsutils \
- && rm -rf /var/lib/apt/lists/*
+ && locale-gen en_US.UTF-8 \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+ENV LANG en_US.UTF-8
+ENV LANGUAGE en_US:en
+ENV LC_ALL en_US.UTF-8
 
 # Copier et installer les dépendances Python
 WORKDIR /app
