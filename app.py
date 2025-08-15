@@ -1,88 +1,222 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+import logging
 import socket
 import re
 import subprocess
 import ssl
-from typing import Dict, List, Optional, Any, Union
-from datetime import datetime
-from flask_cors import CORS
-import logging
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configure logging
+# Optional dependencies (handled gracefully if missing)
+try:
+    import dns.resolver  # dnspython
+except Exception:
+    dns = None
+
+try:
+    from OpenSSL import crypto  # pyOpenSSL
+except Exception:
+    crypto = None
+
+try:
+    import whois as pywhois  # python-whois
+except Exception:
+    pywhois = None
+
+# -----------------------------------------------------------------------------
+# App setup
+# -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins=["https://dnx.bedouiadem.tech"])
+CORS(app, origins=[
+    "https://dnx.bedouiadem.tech",
+    "http://localhost",
+    "https://localhost", 
+    "http://127.0.0.1",
+    "https://127.0.0.1"
+])
 
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 def clean_domain(domain: str) -> str:
-    """Clean and normalize domain name."""
-    domain = re.sub(r'^https?://', '', domain)
-    domain = domain.split('/')[0]
-    domain = domain.split(':')[0]
-    domain = re.sub(r'^www\.', '', domain)
+    """Normalize domain input."""
+    domain = re.sub(r'^https?://', '', domain, flags=re.IGNORECASE)
+    domain = domain.split('/')[0].split(':')[0]
+    domain = re.sub(r'^www\.', '', domain, flags=re.IGNORECASE)
     return domain.strip().lower()
 
+
 def get_ip(domain: str) -> Optional[str]:
-    """Get IP address for a domain."""
+    """Resolve A/AAAA to an IP (prefers IPv4 if present)."""
     try:
-        return socket.gethostbyname(domain)
-    except socket.gaierror:
-        logger.warning(f"Could not resolve IP for domain: {domain}")
+        # Try IPv4 first
+        info = socket.getaddrinfo(domain, None, proto=socket.IPPROTO_TCP)
+        # (family, type, proto, canonname, sockaddr)
+        for fam, _type, _proto, _name, sockaddr in info:
+            if fam == socket.AF_INET:
+                return sockaddr[0]
+        # Fallback to first result (may be IPv6)
+        return info[0][4][0] if info else None
+    except Exception as e:
+        logger.warning(f"IP resolution failed for {domain}: {e}")
         return None
+
 
 def get_reverse_dns(ip: str) -> Optional[str]:
-    """Get reverse DNS for an IP address."""
     try:
         return socket.gethostbyaddr(ip)[0]
-    except socket.herror:
-        logger.warning(f"Could not resolve reverse DNS for IP: {ip}")
+    except Exception as e:
+        logger.warning(f"Reverse DNS failed for {ip}: {e}")
         return None
 
-def get_dns_records(domain: str, record_type: str) -> List[str]:
-    """Get DNS records of a specific type for a domain."""
-    try:
-        import dns.resolver
-        answers = dns.resolver.resolve(domain, record_type)
-        return [rdata.to_text() for rdata in answers]
-    except Exception as e:
-        logger.warning(f"Could not get {record_type} records for {domain}: {e}")
-        return []
 
-def get_specific_record(domain: str, record_type: str, record_name: str) -> List[str]:
-    """Get specific DNS record for a domain."""
-    try:
-        import dns.resolver
-        query = f"{record_name}.{domain}"
-        answers = dns.resolver.resolve(query, record_type)
-        return [rdata.to_text() for rdata in answers]
-    except Exception as e:
-        logger.warning(f"Could not get {record_type} record {record_name} for {domain}: {e}")
-        return []
+# -----------------------------------------------------------------------------
+# DNS with timeouts + per-request cache
+# -----------------------------------------------------------------------------
+class DNSHelper:
+    def __init__(self, warnings: List[str]):
+        self.warnings = warnings
+        self.cache: Dict[Tuple[str, str], List[str]] = {}
 
-def run_whois(domain: str) -> Optional[str]:
-    """Run whois command for a domain."""
+        self.available = dns is not None and hasattr(dns, "resolver")
+        if self.available:
+            try:
+                self.resolver = dns.resolver.Resolver()
+                # Keep lookups snappy
+                self.resolver.timeout = 2.0
+                self.resolver.lifetime = 3.0
+                # Reduce retries to speed-up failure
+                if hasattr(self.resolver, "retry_servfail") and self.resolver.retry_servfail:
+                    self.resolver.retry_servfail = 0
+            except Exception as e:
+                self.available = False
+                self.warnings.append(f"DNS resolver init failed: {e}")
+
+    def _query(self, name: str, rtype: str) -> List[str]:
+        key = (name, rtype)
+        if key in self.cache:
+            return self.cache[key]
+        if not self.available:
+            self.warnings.append("DNS lookups unavailable (dnspython not installed).")
+            self.cache[key] = []
+            return []
+
+        try:
+            answers = self.resolver.resolve(name, rtype)
+            out = [r.to_text() for r in answers]
+            self.cache[key] = out
+            return out
+        except Exception as e:
+            self.warnings.append(f"DNS {rtype} lookup failed for {name}: {e}")
+            self.cache[key] = []
+            return []
+
+    def records(self, domain: str, rtype: str) -> List[str]:
+        return self._query(domain, rtype)
+
+    def specific(self, domain: str, rtype: str, host: str) -> List[str]:
+        fqdn = f"{host}.{domain}".strip(".")
+        return self._query(fqdn, rtype)
+
+
+# -----------------------------------------------------------------------------
+# WHOIS helpers
+# -----------------------------------------------------------------------------
+def run_whois_subprocess(domain: str, timeout: int = 12) -> Optional[str]:
+    """Fallback WHOIS via system command."""
     try:
         result = subprocess.run(
-            ['whois', domain], 
-            capture_output=True, 
-            text=True, 
-            timeout=15
+            ["whois", domain],
+            capture_output=True,
+            text=True,
+            timeout=timeout
         )
-        if result.returncode == 0:
+        if result.returncode == 0 and result.stdout:
             return result.stdout
-        else:
-            logger.warning(f"Whois command failed for {domain}: {result.stderr}")
-            return None
+        logger.warning(f"whois command non-zero or empty for {domain}: {result.stderr}")
+        return None
     except subprocess.TimeoutExpired:
-        logger.warning(f"Whois command timed out for {domain}")
+        logger.warning(f"whois subprocess timeout for {domain}")
         return None
     except Exception as e:
-        logger.warning(f"Error running whois for {domain}: {e}")
+        logger.warning(f"whois subprocess error for {domain}: {e}")
         return None
 
+
+def parse_generic_whois(text: str) -> Dict[str, Any]:
+    """Lightweight parser for common WHOIS fields."""
+    domain_statuses = []
+    creation = None
+
+    # Domain Status
+    for status in re.findall(r"Domain Status:\s*([^\n\r]+)", text, re.IGNORECASE):
+        code = status.split()[0].strip().upper()
+        if code and code != "ACTIVE":
+            domain_statuses.append(code)
+
+    # Creation Date
+    patterns = [
+        r"Creation Date:\s*([^\n\r]+)",
+        r"Created On:\s*([^\n\r]+)",
+        r"Created:\s*([^\n\r]+)",
+        r"Registration Date:\s*([^\n\r]+)"
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            continue
+        date_str = m.group(1).strip()
+        for fmt in [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d %H:%M:%S",
+            "%d-%b-%Y",
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M:%S %Z",
+            "%b %d %H:%M:%S %Y %Z"
+        ]:
+            try:
+                creation_dt = datetime.strptime(date_str, fmt)
+                creation = creation_dt.strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+        if creation:
+            break
+
+    return {
+        "creation_date": creation,
+        "domain_status": list(set(domain_statuses))
+    }
+
+
+def extract_registrar_name(whois_text: str, domain: str = "") -> Optional[str]:
+    """Extract registrar name from WHOIS output (non-.tn)."""
+    if not whois_text:
+        return None
+    # Generic patterns
+    patterns = [
+        r"Registrar:\s*([^\n\r]+)",
+        r"Registrar Name:\s*([^\n\r]+)",
+        r"Sponsoring Registrar:\s*([^\n\r]+)",
+        r"Registrar Organization:\s*([^\n\r]+)",
+        r"Registrar\s*:\s*([^\n\r]+)"
+    ]
+    for p in patterns:
+        m = re.search(p, whois_text, re.IGNORECASE)
+        if m:
+            reg = m.group(1).strip()
+            if reg and reg.lower() not in ("", "none", "n/a"):
+                return reg
+    return None
+
+
+# Keep your .tn WHOIS parser as-is (you said to exclude changing it)
 def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
-    """Parse whois output for .tn domains."""
     match = re.search(r"# whois\.ati\.tn(.*)", text, re.DOTALL | re.IGNORECASE)
     if not match:
         return None
@@ -94,7 +228,6 @@ def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
     registrant = None
     admin_contact = None
 
-    # Parse creation date
     creation_match = re.search(r"Creation date\s*\.{7,}\s*:\s*(.+)", section, re.IGNORECASE)
     if creation_match:
         date_str = creation_match.group(1).strip()
@@ -105,31 +238,26 @@ def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"Error parsing creation date: {e}")
 
-    # Parse domain statuses
     status_matches = re.findall(r"Domain status\s*\.{7,}\s*:\s*([^\n\r]+)", section, re.IGNORECASE)
     for status in status_matches:
         clean_status = status.strip().upper().lstrip(":").strip()
         if clean_status and clean_status != "ACTIVE":
             domain_statuses.append(clean_status)
 
-    # Parse registrar information
     registrar_match = re.search(r"Registrar\s*\.{7,}\s*:\s*(.+)", section, re.IGNORECASE)
     if registrar_match:
         registrar = registrar_match.group(1).strip()
         if registrar.lower() in ['', 'none', 'n/a']:
             registrar = "ATI (Agence Tunisienne d'Internet)"
 
-    # Parse registrant (Owner Contact) Name and First name
     registrant_name = None
     registrant_first_name = None
-    # Try to find Owner Contact section
     owner_section_match = re.search(r"Owner Contact(.*?)(?:Administrativ contact|Technical contact|DNS servers|$)", section, re.IGNORECASE | re.DOTALL)
     if owner_section_match:
         owner_section = owner_section_match.group(1)
         name_match = re.search(r"Name\s*\.*\s*:\s*([^\n\r]+)", owner_section, re.IGNORECASE)
         if name_match:
             registrant_name = name_match.group(1).strip()
-            # Ignore if value looks like a field label or address
             if registrant_name.lower().startswith('address') or 'address' in registrant_name.lower():
                 registrant_name = None
         first_name_match = re.search(r"First name\s*\.*\s*:\s*([^\n\r]+)", owner_section, re.IGNORECASE)
@@ -137,7 +265,6 @@ def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
             registrant_first_name = first_name_match.group(1).strip()
             if registrant_first_name.lower().startswith('address') or 'address' in registrant_first_name.lower():
                 registrant_first_name = None
-    # Merge Name and First name for registrant
     if registrant_name and registrant_first_name:
         registrant = f"{registrant_name} {registrant_first_name}"
     elif registrant_name:
@@ -145,7 +272,6 @@ def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
     elif registrant_first_name:
         registrant = registrant_first_name
 
-    # Parse admin contact (Administrativ contact) Name and First name
     admin_name = None
     admin_first_name = None
     admin_section_match = re.search(r"Administrativ contact(.*?)(?:Technical contact|DNS servers|$)", section, re.IGNORECASE | re.DOTALL)
@@ -161,7 +287,6 @@ def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
             admin_first_name = admin_first_name_match.group(1).strip()
             if admin_first_name.lower().startswith('address') or 'address' in admin_first_name.lower():
                 admin_first_name = None
-    # Merge Name and First name for admin contact
     if admin_name and admin_first_name:
         admin_contact = f"{admin_name} {admin_first_name}"
     elif admin_name:
@@ -177,367 +302,312 @@ def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
         "admin_contact": admin_contact
     }
 
-def parse_generic_whois(text: str) -> Dict[str, Any]:
-    """Parse generic whois output."""
-    domain_statuses = []
-    creation = None
 
-    # Parse domain statuses
-    status_matches = re.findall(r"Domain Status:\s*([^\n\r]+)", text, re.IGNORECASE)
-    for status in status_matches:
-        code = status.split()[0].upper()
-        if code and code != "ACTIVE":
-            domain_statuses.append(code)
+def whois_lookup(domain: str, warnings: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """
+    Returns: (whois_data, registrar_name, raw_text)
+    Uses python-whois first (if available), then subprocess fallback.
+    """
+    raw = None
+    data = None
+    registrar = None
 
-    # Parse creation date
-    creation_patterns = [
-        r"Creation Date:\s*([^\n\r]+)",
-        r"Created On:\s*([^\n\r]+)",
-        r"Created:\s*([^\n\r]+)",
-        r"Registration Date:\s*([^\n\r]+)"
-    ]
-    
-    for pattern in creation_patterns:
-        creation_match = re.search(pattern, text, re.IGNORECASE)
-        if creation_match:
-            date_str = creation_match.group(1).strip()
-            # Try multiple date formats
-            date_formats = [
-                "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%d %H:%M:%S",
-                "%d-%b-%Y",
-                "%Y-%m-%d",
-                "%Y-%m-%d %H:%M:%S %Z",
-                "%b %d %H:%M:%S %Y %Z"
-            ]
-            
-            for fmt in date_formats:
-                try:
-                    creation_dt = datetime.strptime(date_str, fmt)
-                    creation = creation_dt.strftime("%Y-%m-%d")
-                    break
-                except ValueError:
-                    continue
-            if creation:
-                break
+    try:
+        if pywhois:
+            try:
+                w = pywhois.whois(domain)  # may raise exceptions internally
+                # python-whois returns a dict-like object; not standardized across TLDs
+                raw = str(w)
+                # Extract creation date
+                creation = None
+                created = w.creation_date
+                # python-whois may give a datetime or list of datetimes
+                if created:
+                    if isinstance(created, list):
+                        d0 = created[0]
+                        if hasattr(d0, "strftime"):
+                            creation = d0.strftime("%Y-%m-%d")
+                    elif hasattr(created, "strftime"):
+                        creation = created.strftime("%Y-%m-%d")
+                # Extract status (could be various types)
+                statuses = []
+                st = w.status
+                if isinstance(st, list):
+                    statuses = [str(s).split()[0].upper() for s in st if s]
+                elif isinstance(st, str):
+                    statuses = [st.split()[0].upper()]
+                # Registrar
+                registrar = None
+                if hasattr(w, "registrar") and w.registrar:
+                    registrar = str(w.registrar).strip()
+                data = {
+                    "creation_date": creation,
+                    "domain_status": list(set([s for s in statuses if s and s != "ACTIVE"]))
+                }
+            except Exception as e:
+                warnings.append(f"python-whois failed: {e}")
+                raw = None  # fall through
+        if raw is None:
+            raw = run_whois_subprocess(domain)
+            if raw:
+                if domain.endswith(".tn"):
+                    data = parse_whois_tn(raw)
+                    # Extract registrar for .tn (or default handled in parse if missing)
+                    if data and data.get("registrar"):
+                        registrar = data.get("registrar")
+                    else:
+                        registrar = "ATI (Agence Tunisienne d'Internet)"
+                else:
+                    data = parse_generic_whois(raw)
+                    registrar = extract_registrar_name(raw, domain)
+    except Exception as e:
+        warnings.append(f"WHOIS lookup error: {e}")
 
-    return {
-        "creation_date": creation,
-        "domain_status": list(set(domain_statuses))
+    return data, registrar, raw
+
+
+# -----------------------------------------------------------------------------
+# SSL (precise) with TLS fallbacks
+# -----------------------------------------------------------------------------
+def _ssl_try_connect(domain: str, port: int, ctx: ssl.SSLContext) -> bytes:
+    """Return leaf cert in DER or raise."""
+    with socket.create_connection((domain, port), timeout=10) as sock:
+        with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+            return ssock.getpeercert(binary_form=True)
+
+
+def _ctx_default() -> ssl.SSLContext:
+    c = ssl.create_default_context()
+    # We don't verify to allow fetching certs even if chain is broken; this is an info tool
+    c.check_hostname = False
+    c.verify_mode = ssl.CERT_NONE
+    return c
+
+
+def _ctx_tls12() -> ssl.SSLContext:
+    c = _ctx_default()
+    # Force TLSv1.2 only (if available)
+    if hasattr(ssl, "TLSVersion"):
+        c.minimum_version = ssl.TLSVersion.TLSv1_2
+        c.maximum_version = ssl.TLSVersion.TLSv1_2
+    return c
+
+
+def _ctx_tls13() -> ssl.SSLContext:
+    c = _ctx_default()
+    if hasattr(ssl, "TLSVersion"):
+        c.minimum_version = ssl.TLSVersion.TLSv1_3
+        c.maximum_version = ssl.TLSVersion.TLSv1_3
+    return c
+
+
+def get_ssl_info(domain: str, warnings: List[str]) -> Dict[str, Any]:
+    """
+    Precise SSL info using PyOpenSSL to parse the leaf certificate.
+    Tries multiple TLS contexts for better compatibility.
+    """
+    if crypto is None:
+        warnings.append("PyOpenSSL not installed; SSL details unavailable.")
+        return {"status": "Unavailable", "error": "pyOpenSSL not installed"}
+
+    attempts = []
+    # Try default (negotiate), then TLS 1.3, then TLS 1.2
+    for make_ctx, label in [(_ctx_default, "default"), (_ctx_tls13, "tls1_3"), (_ctx_tls12, "tls1_2")]:
+        try:
+            der = _ssl_try_connect(domain, 443, make_ctx())
+            attempts.append((label, "ok"))
+            # Parse with OpenSSL
+            x509 = crypto.load_certificate(crypto.FILETYPE_ASN1, der)
+
+            issuer = dict(x509.get_issuer().get_components())
+            subject = dict(x509.get_subject().get_components())
+
+            issuer_name = (issuer.get(b'O') or issuer.get(b'CN') or b"Unknown").decode(errors="ignore")
+            subject_cn = (subject.get(b'CN') or b"Unknown").decode(errors="ignore")
+
+            # Validity (UTC)
+            not_before = datetime.strptime(x509.get_notBefore().decode("ascii"), "%Y%m%d%H%M%SZ").replace(tzinfo=timezone.utc)
+            not_after = datetime.strptime(x509.get_notAfter().decode("ascii"), "%Y%m%d%H%M%SZ").replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+
+            # SANs
+            san_list: List[str] = []
+            try:
+                for i in range(x509.get_extension_count()):
+                    ext = x509.get_extension(i)
+                    if ext.get_short_name().decode() == "subjectAltName":
+                        san_list = [x.strip() for x in str(ext).split(",")]
+                        break
+            except Exception:
+                pass
+
+            # Self-signed?
+            is_self_signed = x509.get_issuer().der() == x509.get_subject().der()
+
+            # Key size & sig algo
+            key_bits = None
+            try:
+                key_bits = x509.get_pubkey().bits()
+            except Exception:
+                pass
+
+            sig_alg = None
+            try:
+                sig_alg = x509.get_signature_algorithm().decode(errors="ignore")
+            except Exception:
+                pass
+
+            status = "Valid" if (not_before <= now <= not_after) else "Invalid"
+            days_left = max(0, (not_after - now).days)
+
+            return {
+                "status": status,
+                "issuer": issuer_name,
+                "subject": subject_cn,
+                "valid_from": not_before.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "valid_until": not_after.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "days_until_expiry": days_left,
+                "is_self_signed": is_self_signed,
+                "key_size": key_bits,
+                "signature_algorithm": sig_alg,
+                "subject_alt_names": san_list or None,
+                "handshake_context": label
+            }
+        except Exception as e:
+            attempts.append((label, f"fail: {e}"))
+            continue
+
+    # If all attempts failed
+    warnings.append(f"SSL handshake failed in all contexts: {attempts}")
+    return {"status": "Error", "error": "SSL handshake failed", "attempts": attempts}
+
+
+# -----------------------------------------------------------------------------
+# Core domain check (runs parts concurrently)
+# -----------------------------------------------------------------------------
+def check_domain_data(domain: str) -> Dict[str, Any]:
+    warnings: List[str] = []
+    domain = clean_domain(domain)
+    if not domain:
+        return {"error": "Domain is required"}
+
+    ip = get_ip(domain)
+    reverse_dns = get_reverse_dns(ip) if ip else None
+
+    dns_helper = DNSHelper(warnings)
+
+    # Prepare concurrent tasks
+    tasks = {}
+    results: Dict[str, Any] = {}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        # DNS in parallel
+        tasks["A"] = pool.submit(dns_helper.records, domain, "A")
+        tasks["MX"] = pool.submit(dns_helper.records, domain, "MX")
+        tasks["NS"] = pool.submit(dns_helper.records, domain, "NS")
+        tasks["TXT_ALL"] = pool.submit(dns_helper.records, domain, "TXT")
+        tasks["DKIM"] = pool.submit(dns_helper.specific, domain, "TXT", "default._domainkey")
+        tasks["DMARC"] = pool.submit(dns_helper.specific, domain, "TXT", "_dmarc")
+
+        # WHOIS (single task)
+        tasks["WHOIS"] = pool.submit(whois_lookup, domain, warnings)
+
+        # SSL (only if we resolved an IP; still use domain for SNI)
+        if ip:
+            tasks["SSL"] = pool.submit(get_ssl_info, domain, warnings)
+        else:
+            results["ssl"] = {"status": "Unavailable", "error": "Domain does not resolve"}
+
+        # Collect results
+        for name, fut in tasks.items():
+            try:
+                res = fut.result(timeout=15)
+                results[name] = res
+            except Exception as e:
+                warnings.append(f"Task {name} failed: {e}")
+                if name in ("A", "MX", "NS", "TXT_ALL", "DKIM", "DMARC"):
+                    results[name] = []
+                elif name == "SSL":
+                    results[name] = {"status": "Error", "error": str(e)}
+                elif name == "WHOIS":
+                    results[name] = (None, None, None)
+
+    # Post-process DNS TXT to extract SPF/DMARC
+    txt_all: List[str] = results.get("TXT_ALL", []) or []
+    spf = [r for r in txt_all if "v=spf1" in r.lower()]
+    dmarc_raw: List[str] = results.get("DMARC", []) or []
+    dmarc_filtered = [r for r in dmarc_raw if "v=dmarc1" in r.lower()]
+
+    # WHOIS unpack
+    whois_data, registrar_name, _raw = results.get("WHOIS", (None, None, None))
+
+    # Build response
+    response = {
+        "domain": domain,
+        "status": "Registered" if ip else "Available",
+        "ip_address": ip,
+        "reverse_dns": reverse_dns,
+
+        "A": results.get("A", []),
+        "MX": results.get("MX", []),
+        "nameservers": results.get("NS", []),
+
+        "SPF": spf,
+        "DKIM": results.get("DKIM", []),
+        "DMARC": dmarc_filtered,
+
+        "domain_status": (whois_data or {}).get("domain_status", []),
+        "registration_date": (whois_data or {}).get("creation_date"),
+        "registrar_name": registrar_name,
+
+        "ssl": results.get("SSL") or results.get("ssl")
     }
 
-def get_ssl_info(domain: str) -> Dict[str, Any]:
-    """Get SSL certificate information for a domain."""
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((domain, 443), timeout=10) as sock:
-            with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert = ssock.getpeercert()
-                cert_bin = ssock.getpeercert(binary_form=True)
-                
-                if not cert or not cert_bin:
-                    return {
-                        "status": "Error",
-                        "error": "No certificate data received"
-                    }
+    # Add .tn extras if present
+    if domain.endswith(".tn") and whois_data:
+        if whois_data.get("registrant"):
+            response["registrant"] = whois_data.get("registrant")
+        if whois_data.get("admin_contact"):
+            response["admin_contact"] = whois_data.get("admin_contact")
 
-                # Parse certificate dates
-                not_before_str = cert.get('notBefore')
-                not_after_str = cert.get('notAfter')
-                
-                if not not_before_str or not not_after_str:
-                    return {
-                        "status": "Error",
-                        "error": "Certificate dates not found"
-                    }
+    # Attach warnings only if any
+    if warnings:
+        response["warnings"] = warnings
 
-                try:
-                    not_before = datetime.strptime(str(not_before_str), '%b %d %H:%M:%S %Y %Z')
-                    not_after = datetime.strptime(str(not_after_str), '%b %d %H:%M:%S %Y %Z')
-                except ValueError as e:
-                    return {
-                        "status": "Error",
-                        "error": f"Invalid certificate date format: {e}"
-                    }
+    # Clean out empty/null values
+    return {k: v for k, v in response.items() if v not in (None, "", [], {})}
 
-                # Parse issuer information
-                issuer_name = "Unknown"
-                issuer_data = cert.get('issuer')
-                if issuer_data:
-                    # issuer_data is usually a tuple of tuples: ((('countryName', 'US'), ...), ...)
-                    # We'll flatten and look for organizationName or commonName
-                    issuer_fields = ['organizationName', 'commonName', 'organizationalUnitName']
-                    found = False
-                    if isinstance(issuer_data, tuple):
-                        for field in issuer_fields:
-                            for item in issuer_data:
-                                if isinstance(item, tuple):
-                                    # item can be (('organizationName', 'Let's Encrypt'),)
-                                    for subitem in item:
-                                        if isinstance(subitem, tuple) and len(subitem) == 2:
-                                            if subitem[0] == field:
-                                                issuer_name = subitem[1]
-                                                found = True
-                                                break
-                                    if found:
-                                        break
-                            if found:
-                                break
-                        # If still unknown, try to extract from commonName with known patterns
-                        if issuer_name == "Unknown":
-                            for item in issuer_data:
-                                for subitem in item:
-                                    if isinstance(subitem, tuple) and len(subitem) == 2 and subitem[0] == 'commonName':
-                                        cn_value = subitem[1]
-                                        if "Let's Encrypt" in cn_value:
-                                            issuer_name = "Let's Encrypt"
-                                        elif "Sectigo" in cn_value or "COMODO" in cn_value:
-                                            issuer_name = "Sectigo"
-                                        elif "DigiCert" in cn_value:
-                                            issuer_name = "DigiCert"
-                                        elif "GlobalSign" in cn_value:
-                                            issuer_name = "GlobalSign"
-                                        elif "GoDaddy" in cn_value:
-                                            issuer_name = "GoDaddy"
-                                        elif "Amazon" in cn_value:
-                                            issuer_name = "Amazon"
-                                        elif "Cloudflare" in cn_value:
-                                            issuer_name = "Cloudflare"
-                                        elif "Google" in cn_value:
-                                            issuer_name = "Google"
-                                        elif "Microsoft" in cn_value:
-                                            issuer_name = "Microsoft"
-                                        else:
-                                            issuer_name = cn_value
-                                        break
-                    elif isinstance(issuer_data, dict):
-                        issuer_name = issuer_data.get('organizationName', 'Unknown')
-                        if issuer_name == 'Unknown':
-                            cn_value = issuer_data.get('commonName', 'Unknown')
-                            if cn_value != 'Unknown':
-                                if "Let's Encrypt" in cn_value:
-                                    issuer_name = "Let's Encrypt"
-                                elif "Sectigo" in cn_value or "COMODO" in cn_value:
-                                    issuer_name = "Sectigo"
-                                elif "DigiCert" in cn_value:
-                                    issuer_name = "DigiCert"
-                                elif "GlobalSign" in cn_value:
-                                    issuer_name = "GlobalSign"
-                                elif "GoDaddy" in cn_value:
-                                    issuer_name = "GoDaddy"
-                                elif "Amazon" in cn_value:
-                                    issuer_name = "Amazon"
-                                elif "Cloudflare" in cn_value:
-                                    issuer_name = "Cloudflare"
-                                elif "Google" in cn_value:
-                                    issuer_name = "Google"
-                                elif "Microsoft" in cn_value:
-                                    issuer_name = "Microsoft"
-                                else:
-                                    issuer_name = cn_value
 
-                now = datetime.now()
-                is_valid = not_before <= now <= not_after
-                days_until_expiry = (not_after - now).days
-
-                ssl_response = {
-                    "status": "Valid" if is_valid else "Invalid",
-                    "issuer": issuer_name,
-                    "valid_from": not_before.strftime('%Y-%m-%d'),
-                    "valid_until": not_after.strftime('%Y-%m-%d'),
-                    "days_until_expiry": days_until_expiry
-                }
-                
-                # Only add subject_alt_names if it exists and is not empty
-                subject_alt_names = cert.get('subjectAltName', [])
-                if subject_alt_names:
-                    ssl_response["subject_alt_names"] = subject_alt_names
-                
-                return ssl_response
-    except Exception as e:
-        logger.warning(f"SSL error for {domain}: {e}")
-        return {
-            "status": "Error",
-            "error": str(e)
-        }
-
-def clean_response_data(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove null values and empty lists from response data."""
-    cleaned = {}
-    for key, value in data.items():
-        if value is not None and value != [] and value != "":
-            cleaned[key] = value
-    return cleaned
-
-def extract_registrar_name(whois_text: str, domain: str = "") -> Optional[str]:
-    """Extract registrar name from whois output."""
-    if not whois_text:
-        return None
-    
-    # Special handling for .tn domains
-    if domain.endswith('.tn'):
-        # Look for registrar information in .tn whois format
-        tn_patterns = [
-            r"Registrar\s*\.{7,}\s*:\s*([^\n\r]+)",
-            r"Registrar Name\s*\.{7,}\s*:\s*([^\n\r]+)",
-            r"Sponsoring Registrar\s*\.{7,}\s*:\s*([^\n\r]+)",
-            r"Registrar\s*:\s*([^\n\r]+)",
-            r"Registrar Name\s*:\s*([^\n\r]+)"
-        ]
-        
-        for pattern in tn_patterns:
-            match = re.search(pattern, whois_text, re.IGNORECASE)
-            if match:
-                registrar = match.group(1).strip()
-                if registrar and registrar.lower() not in ['', 'none', 'n/a']:
-                    return registrar
-        
-        # If no specific registrar found, return the default .tn registrar
-        return "ATI (Agence Tunisienne d'Internet)"
-    
-    # Generic patterns for other domains
-    patterns = [
-        r"Registrar:\s*([^\n\r]+)",
-        r"Registrar Name:\s*([^\n\r]+)",
-        r"Sponsoring Registrar:\s*([^\n\r]+)",
-        r"Registrar Organization:\s*([^\n\r]+)",
-        r"Registrar\s*:\s*([^\n\r]+)"
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, whois_text, re.IGNORECASE)
-        if match:
-            registrar = match.group(1).strip()
-            if registrar and registrar.lower() not in ['', 'none', 'n/a']:
-                return registrar
-    
-    return None
-
-@app.route('/api/check-domain', methods=['POST'])
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.route("/api/check-domain", methods=["POST"])
 def check_domain():
-    """Main endpoint to check domain information."""
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-        
-        raw_domain = data.get("domain", "").strip()
+        data = request.get_json(silent=True) or {}
+        raw_domain = (data.get("domain") or "").strip()
         if not raw_domain:
             return jsonify({"error": "Domain is required"}), 400
 
-        domain = clean_domain(raw_domain)
-        logger.info(f"Checking domain: {domain}")
-
-        # Get basic domain information
-        ip = get_ip(domain)
-        reverse_dns = get_reverse_dns(ip) if ip else None
-
-        # Get whois information
-        whois_text = run_whois(domain)
-        whois_data = None
-        registrar_name = None
-
-        if whois_text:
-            registrar_name = extract_registrar_name(whois_text, domain)
-            if domain.endswith('.tn'):
-                whois_data = parse_whois_tn(whois_text)
-            else:
-                whois_data = parse_generic_whois(whois_text)
-
-        # Get DNS records
-        all_txt = get_dns_records(domain, "TXT")
-        spf = [r for r in all_txt if "v=spf1" in r.lower()]
-        dkim = get_specific_record(domain, "TXT", "default._domainkey")
-        dmarc = get_specific_record(domain, "TXT", "_dmarc")
-        dmarc_filtered = [r for r in dmarc if "v=dmarc1" in r.lower()]
-
-        # Get SSL information only if domain resolves
-        ssl_info = get_ssl_info(domain) if ip else None
-
-        response = {
-            "domain": domain,
-            "status": "Registered" if ip else "Available",
-            "ip_address": ip,
-            "domain_status": whois_data.get("domain_status", []) if whois_data else [],
-            "A": get_dns_records(domain, "A"),
-            "MX": get_dns_records(domain, "MX"),
-            "SPF": spf,
-            "DKIM": dkim,
-            "DMARC": dmarc_filtered,
-            "reverse_dns": reverse_dns,
-            "registration_date": whois_data.get("creation_date") if whois_data else None,
-            "registrar_name": registrar_name,
-            "nameservers": get_dns_records(domain, "NS"),
-            "ssl": ssl_info
-        }
-        
-        # Add additional .tn domain information if available (only if not null)
-        if domain.endswith('.tn') and whois_data:
-            if whois_data.get("registrant"):
-                response["registrant"] = whois_data.get("registrant")
-            if whois_data.get("admin_contact"):
-                response["admin_contact"] = whois_data.get("admin_contact")
-        
-        # Clean response by removing null values and empty lists
-        cleaned_response = clean_response_data(response)
-        return jsonify(cleaned_response)
-        
+        result = check_domain_data(raw_domain)
+        if "error" in result:
+            return jsonify(result), 400
+        return jsonify(result)
     except Exception as e:
-        logger.error(f"Error processing domain check: {e}")
+        logger.error(f"Error processing /api/check-domain: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
-@app.route('/api/health', methods=['GET'])
+
+@app.route("/api/health", methods=["GET"])
 def health_check():
-    """Health check endpoint."""
-    return jsonify({
-        "status": "healthy", 
-        "version": "1.0.0"
-    })
+    return jsonify({"status": "healthy", "version": "2.0.0"})
 
-@app.route('/api/check-multiple-domains', methods=['POST'])
-def check_multiple_domains():
-    """Check multiple domains at once."""
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-        
-        domains = data.get("domains", [])
-        if not domains or not isinstance(domains, list):
-            return jsonify({"error": "domains must be a non-empty list"}), 400
-        
-        if len(domains) > 10:  # Limit to prevent abuse
-            return jsonify({"error": "Maximum 10 domains allowed per request"}), 400
 
-        results = []
-        for domain in domains:
-            if isinstance(domain, str) and domain.strip():
-                # Create a mock request context for the single domain check
-                with app.test_request_context(
-                    '/api/check-domain',
-                    method='POST',
-                    json={"domain": domain.strip()}
-                ):
-                    result = check_domain()
-                    if isinstance(result, tuple):
-                        # Error response (tuple of response and status code)
-                        response_obj, status_code = result
-                        results.append({
-                            "domain": domain.strip(),
-                            "error": response_obj.get_json().get("error", "Unknown error")
-                        })
-                    else:
-                        # Success response (Response object)
-                        results.append(result.get_json())
+# No /api/check-multiple-domains (removed by request)
 
-        return jsonify({
-            "results": results,
-            "total_checked": len(results)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error processing multiple domains: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-
-if __name__ == '__main__':
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Keep debug True for development; set to False in production
     app.run(debug=True, host="0.0.0.0", port=5000)
