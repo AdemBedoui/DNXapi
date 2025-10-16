@@ -39,6 +39,7 @@ app = Flask(__name__)
 CORS(app, origins=[
     "https://dnx.bedouiadem.tech",
     "http://localhost",
+    "https://dnx.tn",
     "https://localhost", 
     "http://127.0.0.1",
     "https://127.0.0.1"
