@@ -1,19 +1,28 @@
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import logging
 import socket
-import ssl
 import re
+import subprocess
+import ssl
 import time
-import os
-from typing import Any, Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timezone
-import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Optional import; only used if present
+# Optional dependencies
 try:
-    import whois as pywhois  # type: ignore
+    import dns.resolver
+except Exception:
+    dns = None
+
+try:
+    from OpenSSL import crypto
+except Exception:
+    crypto = None
+
+try:
+    import whois as pywhois
 except Exception:
     pywhois = None
 
@@ -22,7 +31,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -31,42 +40,38 @@ CORS(app, origins=[
     "https://dnx.bedouiadem.tech",
     "http://localhost",
     "https://dnx.tn",
-    "https://localhost",
+    "https://localhost", 
     "http://127.0.0.1",
     "https://127.0.0.1"
 ])
 
 # Configuration
 MAX_WORKERS = 4
-# detect Vercel / serverless env -> reduce concurrency to keep cold-start small
-if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
-    MAX_WORKERS = min(MAX_WORKERS, 2)
-
+DNS_TIMEOUT = 2.0
+DNS_LIFETIME = 3.0
 SOCKET_TIMEOUT = 8.0
-WHOIS_TIMEOUT = 6
-CACHE_TTL = 3600  # seconds, 1 hour
+WHOIS_TIMEOUT = 10
 
-_cache: Dict[str, Tuple[Any, float]] = {}
-
-# Cloudflare DNS-over-HTTPS base (JSON)
-DOH_URL = "https://cloudflare-dns.com/dns-query"
-DOH_HEADERS = {"Accept": "application/dns-json", "User-Agent": "dnxapi/1.0"}
-
+# Simple in-memory cache (consider Redis for production)
+_cache = {}
+CACHE_TTL = 3600  # 1 hour
 
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
 def clean_domain(domain: str) -> str:
-    domain = re.sub(r"^https?://", "", domain, flags=re.IGNORECASE)
-    domain = domain.split("/")[0].split(":")[0]
-    domain = re.sub(r"^www\.", "", domain, flags=re.IGNORECASE)
+    """Normalize domain input."""
+    domain = re.sub(r'^https?://', '', domain, flags=re.IGNORECASE)
+    domain = domain.split('/')[0].split(':')[0]
+    domain = re.sub(r'^www\.', '', domain, flags=re.IGNORECASE)
     return domain.strip().lower()
 
 
 def get_cached(key: str) -> Optional[Any]:
+    """Get from cache if not expired."""
     if key in _cache:
-        data, ts = _cache[key]
-        if time.time() - ts < CACHE_TTL:
+        data, timestamp = _cache[key]
+        if time.time() - timestamp < CACHE_TTL:
             logger.debug(f"Cache hit for {key}")
             return data
         else:
@@ -75,345 +80,605 @@ def get_cached(key: str) -> Optional[Any]:
 
 
 def set_cache(key: str, value: Any) -> None:
+    """Store in cache."""
     _cache[key] = (value, time.time())
 
 
-def clear_cache() -> None:
-    _cache.clear()
-
-
-# -----------------------------------------------------------------------------
-# DNS (DoH fallback to avoid system-level deps)
-# -----------------------------------------------------------------------------
-def doh_query(name: str, rtype: str) -> List[str]:
-    """Query Cloudflare DNS-over-HTTPS for a specific record type. Returns list of strings (answers)."""
-    try:
-        params = {"name": name, "type": rtype}
-        resp = requests.get(DOH_URL, params=params, headers=DOH_HEADERS, timeout=3.0)
-        if resp.status_code != 200:
-            logger.debug(f"DoH {rtype} {name} returned status {resp.status_code}")
-            return []
-        data = resp.json()
-        answers = data.get("Answer") or []
-        out: List[str] = []
-        for a in answers:
-            # 'data' value depends on type (TXT quoted, MX includes priority, etc.)
-            val = a.get("data", "")
-            if not val:
-                continue
-            # For TXT, Cloudflare returns like '"v=spf1 ..."' — strip quotes
-            if rtype.upper() == "TXT":
-                # remove leading/trailing quotes if present
-                if val.startswith('"') and val.endswith('"'):
-                    val = val[1:-1]
-            out.append(val)
-        return out
-    except Exception as e:
-        logger.debug(f"DoH query failed for {name} {rtype}: {e}")
-        return []
-
-
-def get_ip_via_socket(domain: str) -> Optional[str]:
-    """Quick IPv4 prefered resolution via socket. Very fast and available in stdlib."""
+def get_ip(domain: str) -> Optional[str]:
+    """Resolve A record (IPv4 preferred)."""
     try:
         info = socket.getaddrinfo(domain, None, proto=socket.IPPROTO_TCP)
         for fam, _type, _proto, _name, sockaddr in info:
             if fam == socket.AF_INET:
                 return sockaddr[0]
-        if info:
-            return info[0][4][0]
+        return info[0][4][0] if info else None
     except Exception as e:
-        logger.debug(f"socket getaddrinfo failed for {domain}: {e}")
-    return None
-
-
-def get_reverse_dns(ip: str) -> Optional[str]:
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception as e:
-        logger.debug(f"reverse DNS failed for {ip}: {e}")
+        logger.warning(f"IP resolution failed for {domain}: {e}")
         return None
 
 
-# -----------------------------------------------------------------------------
-# WHOIS (optional)
-# -----------------------------------------------------------------------------
-def whois_lookup(domain: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
-    """
-    Try python-whois if available. If not installed, return (None, None, None)
-    """
-    if pywhois is None:
-        return None, None, None
-
+def get_reverse_dns(ip: str) -> Optional[str]:
+    """Get reverse DNS."""
     try:
-        w = pywhois.whois(domain)
-        raw = str(w)
-        creation = None
-        created = getattr(w, "creation_date", None)
-        if created:
-            if isinstance(created, list) and created:
-                d0 = created[0]
-                if hasattr(d0, "strftime"):
-                    creation = d0.strftime("%Y-%m-%d")
-            elif hasattr(created, "strftime"):
-                creation = created.strftime("%Y-%m-%d")
-
-        statuses: List[str] = []
-        st = getattr(w, "status", None)
-        if isinstance(st, list):
-            statuses = [str(s).split()[0].upper() for s in st if s]
-        elif isinstance(st, str):
-            statuses = [st.split()[0].upper()]
-
-        registrar = None
-        if hasattr(w, "registrar") and w.registrar:
-            registrar = str(w.registrar).strip()
-
-        data = {"creation_date": creation, "domain_status": list(set([s for s in statuses if s and s != "ACTIVE"]))}
-        return data, registrar, raw
+        return socket.gethostbyaddr(ip)[0]
     except Exception as e:
-        logger.debug(f"python-whois lookup failed for {domain}: {e}")
-        return None, None, None
+        logger.warning(f"Reverse DNS failed for {ip}: {e}")
+        return None
 
 
-# -----------------------------------------------------------------------------
-# SSL (use stdlib)
-# -----------------------------------------------------------------------------
-def get_ssl_info(domain: str, port: int = 443) -> Dict[str, Any]:
-    """Use SSL socket to get cert information via getpeercert (no PyOpenSSL required)."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    try:
-        with socket.create_connection((domain, port), timeout=SOCKET_TIMEOUT) as sock:
-            with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
-                cert = ssock.getpeercert()  # parsed cert (dict)
-    except Exception as e:
-        logger.debug(f"SSL handshake failed for {domain}: {e}")
-        return {"status": "Error", "error": str(e)}
-
-    # cert is a dict with keys like subject, issuer, notBefore, notAfter, subjectAltName
-    try:
-        not_before = cert.get("notBefore")
-        not_after = cert.get("notAfter")
-        # convert to datetime if strings present in format 'Jun  1 12:00:00 2024 GMT'
-        def parse_openssl_date(s: Optional[str]) -> Optional[str]:
-            if not s:
-                return None
-            for fmt in ("%b %d %H:%M:%S %Y %Z", "%Y%m%d%H%M%SZ"):
-                try:
-                    dt = datetime.strptime(s, fmt)
-                    return dt.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-                except Exception:
-                    continue
-            return s
-
-        valid_from = parse_openssl_date(not_before)
-        valid_until = parse_openssl_date(not_after)
-
-        issuer = "Unknown"
-        try:
-            issuer_t = cert.get("issuer")
-            if issuer_t:
-                # issuer is a tuple of tuples like ((('commonName', 'Let's Encrypt'),), ...)
-                parts = []
-                for rdn in issuer_t:
-                    for kv in rdn:
-                        parts.append(f"{kv[0]}={kv[1]}")
-                issuer = ", ".join(parts)
-        except Exception:
-            pass
-
-        subject_cn = "Unknown"
-        try:
-            subject = cert.get("subject")
-            if subject:
-                for rdn in subject:
-                    for kv in rdn:
-                        if kv[0].lower() in ("commonname", "cn"):
-                            subject_cn = kv[1]
-                            break
-        except Exception:
-            pass
-
-        san = None
-        try:
-            san = [v for (k, v) in cert.get("subjectAltName", [])] if cert.get("subjectAltName") else None
-        except Exception:
-            san = None
-
-        # days left
-        days_left = None
-        try:
-            if valid_until:
-                # try parse
-                dt = datetime.strptime(valid_until, "%Y-%m-%d %H:%M:%S %Z")
-                days_left = max(0, (dt - datetime.now(timezone.utc)).days)
-        except Exception:
-            days_left = None
-
-        status = "Valid"
-        try:
-            if valid_from and valid_until:
-                dt_from = datetime.strptime(valid_from, "%Y-%m-%d %H:%M:%S %Z")
-                dt_to = datetime.strptime(valid_until, "%Y-%m-%d %H:%M:%S %Z")
-                now = datetime.now(timezone.utc)
-                if not (dt_from <= now <= dt_to):
-                    status = "Invalid"
-        except Exception:
-            pass
-
-        return {
-            "status": status,
-            "issuer": issuer,
-            "subject": subject_cn,
-            "valid_from": valid_from,
-            "valid_until": valid_until,
-            "days_until_expiry": days_left,
-            "subject_alt_names": san,
-        }
-    except Exception as e:
-        logger.debug(f"Error parsing SSL cert for {domain}: {e}")
-        return {"status": "Error", "error": "parsing failed", "raw_error": str(e)}
-
-
-# -----------------------------------------------------------------------------
-# Domain check orchestration
-# -----------------------------------------------------------------------------
+# Improved: check if domain actually resolves
 def get_domain_status_from_whois(whois_data: Optional[Dict[str, Any]], domain_statuses: List[str]) -> str:
+    """
+    Determine domain status from WHOIS data.
+    WHOIS is the source of truth for domain registration.
+    """
     if whois_data is None:
+        # No WHOIS data = domain not found in registry
         return "Available"
+    
+    # Domain is in the registry (registered)
     if domain_statuses:
+        # If there are statuses, check for "registered" keywords
         statuses_lower = [s.lower() for s in domain_statuses]
-        if any("hold" in s for s in statuses_lower):
+        
+        # Check for hold status
+        if any('hold' in s for s in statuses_lower):
             return "Registered (On Hold)"
-        if any("pending" in s for s in statuses_lower):
+        
+        # Check for other special statuses
+        if any('pending' in s for s in statuses_lower):
             return "Registered (Pending)"
-        if any("redemption" in s for s in statuses_lower):
+        
+        if any('redemption' in s for s in statuses_lower):
             return "Registered (Redemption Period)"
+    
+    # Default: domain is registered
     return "Registered"
 
 
+# -----------------------------------------------------------------------------
+# DNS with timeouts + caching
+# -----------------------------------------------------------------------------
+class DNSHelper:
+    def __init__(self, warnings: List[str]):
+        self.warnings = warnings
+        self.cache: Dict[Tuple[str, str], List[str]] = {}
+        self.available = dns is not None and hasattr(dns, "resolver")
+        
+        if self.available:
+            try:
+                self.resolver = dns.resolver.Resolver()
+                self.resolver.timeout = DNS_TIMEOUT
+                self.resolver.lifetime = DNS_LIFETIME
+                if hasattr(self.resolver, "retry_servfail"):
+                    self.resolver.retry_servfail = 0
+            except Exception as e:
+                self.available = False
+                self.warnings.append(f"DNS resolver init failed: {e}")
+
+    def _query(self, name: str, rtype: str) -> List[str]:
+        key = (name, rtype)
+        if key in self.cache:
+            return self.cache[key]
+        
+        if not self.available:
+            self.warnings.append("DNS lookups unavailable (dnspython not installed).")
+            self.cache[key] = []
+            return []
+
+        try:
+            answers = self.resolver.resolve(name, rtype)
+            out = [r.to_text() for r in answers]
+            self.cache[key] = out
+            return out
+        except Exception as e:
+            logger.debug(f"DNS {rtype} lookup failed for {name}: {e}")
+            self.cache[key] = []
+            return []
+
+    def records(self, domain: str, rtype: str) -> List[str]:
+        return self._query(domain, rtype)
+
+    def specific(self, domain: str, rtype: str, host: str) -> List[str]:
+        fqdn = f"{host}.{domain}".strip(".")
+        return self._query(fqdn, rtype)
+
+
+# -----------------------------------------------------------------------------
+# WHOIS helpers
+# -----------------------------------------------------------------------------
+def run_whois_subprocess(domain: str, timeout: int = WHOIS_TIMEOUT) -> Optional[str]:
+    """Fallback WHOIS via system command."""
+    try:
+        result = subprocess.run(
+            ["whois", domain],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning(f"whois subprocess timeout for {domain}")
+        return None
+    except Exception as e:
+        logger.warning(f"whois subprocess error for {domain}: {e}")
+        return None
+
+
+def parse_generic_whois(text: str) -> Dict[str, Any]:
+    """Parse common WHOIS fields."""
+    domain_statuses = []
+    creation = None
+
+    # Domain Status
+    for status in re.findall(r"Domain Status:\s*([^\n\r]+)", text, re.IGNORECASE):
+        code = status.split()[0].strip().upper()
+        if code and code != "ACTIVE":
+            domain_statuses.append(code)
+
+    # Creation Date - multiple patterns
+    patterns = [
+        r"Creation Date:\s*([^\n\r]+)",
+        r"Created On:\s*([^\n\r]+)",
+        r"Created:\s*([^\n\r]+)",
+        r"Registration Date:\s*([^\n\r]+)"
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            continue
+        date_str = m.group(1).strip()
+        for fmt in [
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d %H:%M:%S",
+            "%d-%b-%Y",
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M:%S %Z",
+            "%b %d %H:%M:%S %Y %Z"
+        ]:
+            try:
+                creation_dt = datetime.strptime(date_str, fmt)
+                creation = creation_dt.strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+        if creation:
+            break
+
+    return {
+        "creation_date": creation,
+        "domain_status": list(set(domain_statuses))
+    }
+
+
+def extract_registrar_name(whois_text: str, domain: str = "") -> Optional[str]:
+    """Extract registrar from WHOIS."""
+    if not whois_text:
+        return None
+    patterns = [
+        r"Registrar:\s*([^\n\r]+)",
+        r"Registrar Name:\s*([^\n\r]+)",
+        r"Sponsoring Registrar:\s*([^\n\r]+)",
+        r"Registrar Organization:\s*([^\n\r]+)",
+    ]
+    for p in patterns:
+        m = re.search(p, whois_text, re.IGNORECASE)
+        if m:
+            reg = m.group(1).strip()
+            if reg and reg.lower() not in ("", "none", "n/a"):
+                return reg
+    return None
+
+
+def parse_whois_tn(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse .tn WHOIS output - CAREFUL PRESERVATION of original logic.
+    Only minimal changes for extraction reliability.
+    """
+    match = re.search(r"# whois\.ati\.tn(.*)", text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return None
+    
+    section = match.group(1)
+    creation = None
+    domain_statuses = []
+    registrar = None
+    registrant = None
+    admin_contact = None
+
+    # Creation date
+    creation_match = re.search(r"Creation date\s*\.{7,}\s*:\s*(.+)", section, re.IGNORECASE)
+    if creation_match:
+        date_str = creation_match.group(1).strip()
+        try:
+            date_clean = re.match(r"(\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2})", date_str)
+            if date_clean:
+                creation = datetime.strptime(date_clean.group(1), "%d-%m-%Y %H:%M:%S").strftime("%Y-%m-%d")
+        except Exception as e:
+            logger.warning(f"Error parsing .tn creation date: {e}")
+
+    # Domain status
+    status_matches = re.findall(r"Domain status\s*\.{7,}\s*:\s*([^\n\r]+)", section, re.IGNORECASE)
+    for status in status_matches:
+        clean_status = status.strip().upper().lstrip(":").strip()
+        if clean_status and clean_status != "ACTIVE":
+            domain_statuses.append(clean_status)
+
+    # Registrar
+    registrar_match = re.search(r"Registrar\s*\.{7,}\s*:\s*(.+)", section, re.IGNORECASE)
+    if registrar_match:
+        registrar = registrar_match.group(1).strip()
+        if registrar.lower() in ['', 'none', 'n/a']:
+            registrar = "ATI (Agence Tunisienne d'Internet)"
+    else:
+        registrar = "ATI (Agence Tunisienne d'Internet)"
+
+    # Owner Contact - IMPROVED EXTRACTION
+    registrant_name = None
+    registrant_first_name = None
+    owner_section_match = re.search(
+        r"Owner Contact(.*?)(?:Administrativ contact|Technical contact|DNS servers|$)",
+        section,
+        re.IGNORECASE | re.DOTALL
+    )
+    if owner_section_match:
+        owner_section = owner_section_match.group(1)
+        
+        # Extract name (avoid address contamination)
+        name_match = re.search(r"Name\s*\.*\s*:\s*([^\n\r]+)", owner_section, re.IGNORECASE)
+        if name_match:
+            registrant_name = name_match.group(1).strip()
+            # Stricter filtering
+            if not registrant_name or registrant_name.lower() in ['address', 'none', 'n/a'] or 'address' in registrant_name.lower():
+                registrant_name = None
+        
+        # Extract first name
+        first_name_match = re.search(r"First name\s*\.*\s*:\s*([^\n\r]+)", owner_section, re.IGNORECASE)
+        if first_name_match:
+            registrant_first_name = first_name_match.group(1).strip()
+            if not registrant_first_name or registrant_first_name.lower() in ['address', 'none', 'n/a'] or 'address' in registrant_first_name.lower():
+                registrant_first_name = None
+    
+    # Combine owner info
+    if registrant_name and registrant_first_name:
+        registrant = f"{registrant_name} {registrant_first_name}"
+    elif registrant_name:
+        registrant = registrant_name
+    elif registrant_first_name:
+        registrant = registrant_first_name
+
+    # Admin Contact - IMPROVED EXTRACTION
+    admin_name = None
+    admin_first_name = None
+    admin_section_match = re.search(
+        r"Administrativ contact(.*?)(?:Technical contact|DNS servers|$)",
+        section,
+        re.IGNORECASE | re.DOTALL
+    )
+    if admin_section_match:
+        admin_section = admin_section_match.group(1)
+        
+        admin_name_match = re.search(r"Name\s*\.*\s*:\s*([^\n\r]+)", admin_section, re.IGNORECASE)
+        if admin_name_match:
+            admin_name = admin_name_match.group(1).strip()
+            if not admin_name or admin_name.lower() in ['address', 'none', 'n/a'] or 'address' in admin_name.lower():
+                admin_name = None
+        
+        admin_first_name_match = re.search(r"First name\s*\.*\s*:\s*([^\n\r]+)", admin_section, re.IGNORECASE)
+        if admin_first_name_match:
+            admin_first_name = admin_first_name_match.group(1).strip()
+            if not admin_first_name or admin_first_name.lower() in ['address', 'none', 'n/a'] or 'address' in admin_first_name.lower():
+                admin_first_name = None
+    
+    # Combine admin info
+    if admin_name and admin_first_name:
+        admin_contact = f"{admin_name} {admin_first_name}"
+    elif admin_name:
+        admin_contact = admin_name
+    elif admin_first_name:
+        admin_contact = admin_first_name
+
+    return {
+        "creation_date": creation,
+        "domain_status": list(set(domain_statuses)),
+        "registrar": registrar,
+        "registrant": registrant,
+        "admin_contact": admin_contact
+    }
+
+
+def whois_lookup(domain: str, warnings: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """WHOIS lookup with fallbacks."""
+    raw = None
+    data = None
+    registrar = None
+
+    try:
+        if pywhois:
+            try:
+                w = pywhois.whois(domain)
+                raw = str(w)
+                
+                # Extract creation date
+                creation = None
+                created = w.creation_date
+                if created:
+                    if isinstance(created, list):
+                        d0 = created[0]
+                        if hasattr(d0, "strftime"):
+                            creation = d0.strftime("%Y-%m-%d")
+                    elif hasattr(created, "strftime"):
+                        creation = created.strftime("%Y-%m-%d")
+                
+                # Extract status
+                statuses = []
+                st = w.status
+                if isinstance(st, list):
+                    statuses = [str(s).split()[0].upper() for s in st if s]
+                elif isinstance(st, str):
+                    statuses = [st.split()[0].upper()]
+                
+                # Extract registrar
+                registrar = None
+                if hasattr(w, "registrar") and w.registrar:
+                    registrar = str(w.registrar).strip()
+                
+                data = {
+                    "creation_date": creation,
+                    "domain_status": list(set([s for s in statuses if s and s != "ACTIVE"]))
+                }
+            except Exception as e:
+                logger.debug(f"python-whois failed: {e}")
+                raw = None
+        
+        if raw is None:
+            raw = run_whois_subprocess(domain)
+            if raw:
+                if domain.endswith(".tn"):
+                    data = parse_whois_tn(raw)
+                    if data and data.get("registrar"):
+                        registrar = data.get("registrar")
+                    else:
+                        registrar = "ATI (Agence Tunisienne d'Internet)"
+                else:
+                    data = parse_generic_whois(raw)
+                    registrar = extract_registrar_name(raw, domain)
+    except Exception as e:
+        warnings.append(f"WHOIS lookup error: {e}")
+        logger.error(f"WHOIS error for {domain}: {e}")
+
+    return data, registrar, raw
+
+
+# -----------------------------------------------------------------------------
+# SSL Certificate Information
+# -----------------------------------------------------------------------------
+def _ctx_default() -> ssl.SSLContext:
+    c = ssl.create_default_context()
+    c.check_hostname = False
+    c.verify_mode = ssl.CERT_NONE
+    return c
+
+
+def _ctx_tls12() -> ssl.SSLContext:
+    c = _ctx_default()
+    if hasattr(ssl, "TLSVersion"):
+        c.minimum_version = ssl.TLSVersion.TLSv1_2
+        c.maximum_version = ssl.TLSVersion.TLSv1_2
+    return c
+
+
+def _ctx_tls13() -> ssl.SSLContext:
+    c = _ctx_default()
+    if hasattr(ssl, "TLSVersion"):
+        c.minimum_version = ssl.TLSVersion.TLSv1_3
+        c.maximum_version = ssl.TLSVersion.TLSv1_3
+    return c
+
+
+def _ssl_try_connect(domain: str, port: int, ctx: ssl.SSLContext) -> bytes:
+    """Get SSL cert or raise."""
+    with socket.create_connection((domain, port), timeout=SOCKET_TIMEOUT) as sock:
+        with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+            return ssock.getpeercert(binary_form=True)
+
+
+def get_ssl_info(domain: str, warnings: List[str]) -> Dict[str, Any]:
+    """Get SSL certificate details."""
+    if crypto is None:
+        warnings.append("PyOpenSSL not installed; SSL details unavailable.")
+        return {"status": "Unavailable", "error": "pyOpenSSL not installed"}
+
+    attempts = []
+    # Try default, TLS 1.3, TLS 1.2
+    for make_ctx, label in [(_ctx_default, "default"), (_ctx_tls13, "tls1_3"), (_ctx_tls12, "tls1_2")]:
+        try:
+            der = _ssl_try_connect(domain, 443, make_ctx())
+            attempts.append((label, "ok"))
+            x509 = crypto.load_certificate(crypto.FILETYPE_ASN1, der)
+
+            issuer = dict(x509.get_issuer().get_components())
+            subject = dict(x509.get_subject().get_components())
+
+            issuer_name = (issuer.get(b'O') or issuer.get(b'CN') or b"Unknown").decode(errors="ignore")
+            subject_cn = (subject.get(b'CN') or b"Unknown").decode(errors="ignore")
+
+            not_before = datetime.strptime(
+                x509.get_notBefore().decode("ascii"), 
+                "%Y%m%d%H%M%SZ"
+            ).replace(tzinfo=timezone.utc)
+            not_after = datetime.strptime(
+                x509.get_notAfter().decode("ascii"),
+                "%Y%m%d%H%M%SZ"
+            ).replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+
+            # SANs
+            san_list: List[str] = []
+            try:
+                for i in range(x509.get_extension_count()):
+                    ext = x509.get_extension(i)
+                    if ext.get_short_name().decode() == "subjectAltName":
+                        san_list = [x.strip() for x in str(ext).split(",")]
+                        break
+            except Exception:
+                pass
+
+            is_self_signed = x509.get_issuer().der() == x509.get_subject().der()
+
+            key_bits = None
+            try:
+                key_bits = x509.get_pubkey().bits()
+            except Exception:
+                pass
+
+            sig_alg = None
+            try:
+                sig_alg = x509.get_signature_algorithm().decode(errors="ignore")
+            except Exception:
+                pass
+
+            status = "Valid" if (not_before <= now <= not_after) else "Invalid"
+            days_left = max(0, (not_after - now).days)
+
+            return {
+                "status": status,
+                "issuer": issuer_name,
+                "subject": subject_cn,
+                "valid_from": not_before.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "valid_until": not_after.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "days_until_expiry": days_left,
+                "is_self_signed": is_self_signed,
+                "key_size": key_bits,
+                "signature_algorithm": sig_alg,
+                "subject_alt_names": san_list or None,
+                "handshake_context": label
+            }
+        except Exception as e:
+            attempts.append((label, f"fail: {e}"))
+            continue
+
+    warnings.append(f"SSL handshake failed in all contexts")
+    return {"status": "Error", "error": "SSL handshake failed", "attempts": attempts}
+
+
+# -----------------------------------------------------------------------------
+# Core domain check - MAJOR OPTIMIZATION
+# With WHOIS as source of truth
+# -----------------------------------------------------------------------------
 def check_domain_data(domain: str) -> Dict[str, Any]:
-    start_ts = time.time()
+    """
+    Main domain checker.
+    WHOIS is the source of truth: if WHOIS has no data, domain is Available.
+    IP resolution is informational only (registered domains can be non-resolvable).
+    """
     warnings: List[str] = []
     domain = clean_domain(domain)
+    
     if not domain:
         return {"error": "Domain is required"}
 
+    # Check cache
     cache_key = f"domain:{domain}"
     cached = get_cached(cache_key)
     if cached:
         return cached
 
-    # Basic IP lookup
-    ip = get_ip_via_socket(domain)
+    # Try to resolve IP (informational, not definitive)
+    ip = get_ip(domain)
     reverse_dns = get_reverse_dns(ip) if ip else None
 
-    # Prepare concurrent tasks that are safe in serverless
+    dns_helper = DNSHelper(warnings)
+
+    # Concurrent tasks
+    tasks = {}
     results: Dict[str, Any] = {}
 
-    def task_dns(rtype: str):
-        return doh_query(domain, rtype)
-
-    def task_whois():
-        return whois_lookup(domain)
-
-    def task_ssl():
-        if ip:
-            return get_ssl_info(domain)
-        return {"status": "Unavailable", "error": "Domain does not resolve"}
-
-    # Launch tasks (DNS records and optional whois/ssl)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            "A": pool.submit(task_dns, "A"),
-            "MX": pool.submit(task_dns, "MX"),
-            "NS": pool.submit(task_dns, "NS"),
-            "TXT_ALL": pool.submit(task_dns, "TXT"),
-            "DKIM": pool.submit(task_dns, "TXT"),   # DKIM commonly under selector._domainkey; we keep general TXT fallback
-            "DMARC": pool.submit(task_dns, "TXT"),
-            "WHOIS": pool.submit(task_whois),
-            "SSL": pool.submit(task_ssl),
-        }
+        # DNS lookups
+        tasks["A"] = pool.submit(dns_helper.records, domain, "A")
+        tasks["MX"] = pool.submit(dns_helper.records, domain, "MX")
+        tasks["NS"] = pool.submit(dns_helper.records, domain, "NS")
+        tasks["TXT_ALL"] = pool.submit(dns_helper.records, domain, "TXT")
+        tasks["DKIM"] = pool.submit(dns_helper.specific, domain, "TXT", "default._domainkey")
+        tasks["DMARC"] = pool.submit(dns_helper.specific, domain, "TXT", "_dmarc")
 
-        # collect
-        for name, fut in futures.items():
+        # WHOIS (source of truth for registration status)
+        tasks["WHOIS"] = pool.submit(whois_lookup, domain, warnings)
+
+        # SSL (only if IP is resolvable)
+        if ip:
+            tasks["SSL"] = pool.submit(get_ssl_info, domain, warnings)
+        else:
+            results["ssl"] = {"status": "Unavailable", "error": "Domain does not resolve"}
+
+        # Collect results with timeout
+        for name, fut in tasks.items():
             try:
-                results[name] = fut.result(timeout=15)
+                res = fut.result(timeout=15)
+                results[name] = res
             except Exception as e:
-                logger.debug(f"Task {name} failed: {e}")
+                logger.error(f"Task {name} failed: {e}")
                 if name in ("A", "MX", "NS", "TXT_ALL", "DKIM", "DMARC"):
                     results[name] = []
-                elif name == "WHOIS":
-                    results[name] = (None, None, None)
                 elif name == "SSL":
                     results[name] = {"status": "Error", "error": str(e)}
+                elif name == "WHOIS":
+                    results[name] = (None, None, None)
 
-    # Postprocess TXT, DMARC, DKIM
+    # Post-process DNS
     txt_all: List[str] = results.get("TXT_ALL", []) or []
     spf = [r for r in txt_all if "v=spf1" in r.lower()]
-    dmarc_candidates = results.get("DMARC", []) or []
-    dmarc_filtered = [r for r in dmarc_candidates if "v=dmarc1" in r.lower()]
+    dmarc_raw: List[str] = results.get("DMARC", []) or []
+    dmarc_filtered = [r for r in dmarc_raw if "v=dmarc1" in r.lower()]
 
-    # For DKIM: look for default selector pattern if available in TXT answers
-    dkim_candidates = []
-    try:
-        # check TXT under default._domainkey.<domain> via separate DoH call (cheap)
-        dkim_candidates = doh_query(f"default._domainkey.{domain}", "TXT")
-    except Exception:
-        dkim_candidates = []
-    if not dkim_candidates:
-        # fallback: try to detect 'v=DKIM1' in TXT_ALL
-        dkim_candidates = [r for r in txt_all if "v=dkim1" in r.lower()]
+    # WHOIS unpack (source of truth)
+    whois_data, registrar_name, _raw = results.get("WHOIS", (None, None, None))
 
-    whois_data, registrar_name, raw_whois = results.get("WHOIS", (None, None, None))
-    domain_statuses = (whois_data or {}).get("domain_status", []) if whois_data else []
+    # Determine status from WHOIS
+    domain_statuses = (whois_data or {}).get("domain_status", [])
     status = get_domain_status_from_whois(whois_data, domain_statuses)
 
+    # Build response
     response = {
         "domain": domain,
         "status": status,
         "ip_address": ip,
         "reverse_dns": reverse_dns,
+
         "A": results.get("A", []),
-        "MX": [m.split()[-1].rstrip(".") for m in (results.get("MX") or [])],  # MX entries often '10 mail.example.'
-        "nameservers": [n.rstrip(".") for n in (results.get("NS") or [])],
+        "MX": results.get("MX", []),
+        "nameservers": results.get("NS", []),
+
         "SPF": spf,
-        "DKIM": dkim_candidates,
+        "DKIM": results.get("DKIM", []),
         "DMARC": dmarc_filtered,
+
         "domain_status": domain_statuses,
-        "registration_date": (whois_data or {}).get("creation_date") if whois_data else None,
+        "registration_date": (whois_data or {}).get("creation_date"),
         "registrar_name": registrar_name,
-        "ssl": results.get("SSL"),
+
+        "ssl": results.get("SSL") or results.get("ssl")
     }
 
-    # Add WHOIS raw or warnings if WHOIS unavailable
-    if pywhois is None:
-        warnings.append("python-whois not installed; WHOIS data unavailable.")
-    else:
-        if whois_data is None:
-            warnings.append("WHOIS lookup returned no data or failed.")
+    # Add .tn-specific fields with safer extraction
+    if domain.endswith(".tn") and whois_data:
+        if whois_data.get("registrant"):
+            response["registrant"] = whois_data.get("registrant")
+        if whois_data.get("admin_contact"):
+            response["admin_contact"] = whois_data.get("admin_contact")
 
-    # If DNS DoH returned no answers at all for A/MX/NS/TXT, warn
-    if not any(results.get(k) for k in ("A", "MX", "NS", "TXT_ALL")):
-        warnings.append("DNS lookups returned no records (possible network error or domain truly has no records).")
-
+    # Attach warnings
     if warnings:
         response["warnings"] = warnings
 
     # Clean empty values
     result = {k: v for k, v in response.items() if v not in (None, "", [], {})}
-
-    # Only cache when we have meaningful non-empty data (avoid caching failure/no-data states)
-    meaningful = bool(result.get("A") or result.get("MX") or result.get("nameservers") or result.get("registration_date") or result.get("ssl"))
-    if meaningful:
-        set_cache(cache_key, result)
-    else:
-        logger.debug(f"Not caching result for {domain} because it's not meaningful: {result}")
-
-    logger.debug(f"Domain check for {domain} completed in {(time.time() - start_ts)*1000:.0f}ms")
+    
+    # Cache result
+    set_cache(cache_key, result)
     return result
 
 
@@ -421,46 +686,38 @@ def check_domain_data(domain: str) -> Dict[str, Any]:
 # Routes
 # -----------------------------------------------------------------------------
 @app.route("/api/check-domain", methods=["POST"])
-def check_domain_post():
+def check_domain():
     try:
         data = request.get_json(silent=True) or {}
         raw_domain = (data.get("domain") or "").strip()
+        
         if not raw_domain:
             return jsonify({"error": "Domain is required"}), 400
+
         result = check_domain_data(raw_domain)
+        
         if "error" in result:
             return jsonify(result), 400
+        
         return jsonify(result)
     except Exception as e:
-        logger.exception("Error in /api/check-domain POST")
+        logger.error(f"Error in /api/check-domain: {e}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
-
-
-@app.route("/api/check-domain", methods=["GET"])
-def check_domain_get():
-    domain = request.args.get("domain", "").strip()
-    if not domain:
-        return jsonify({"error": "Domain is required"}), 400
-    result = check_domain_data(domain)
-    if "error" in result:
-        return jsonify(result), 400
-    resp = make_response(jsonify(result))
-    # Let Vercel CDN cache this GET response briefly; safe for many lookups
-    resp.headers["Cache-Control"] = "s-maxage=60, stale-while-revalidate=120"
-    return resp
 
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "version": "3.0.0"})
+    return jsonify({"status": "healthy", "version": "2.0.1"})
 
 
+# Clear cache endpoint (for testing)
 @app.route("/api/cache/clear", methods=["POST"])
-def clear_cache_route():
-    clear_cache()
+def clear_cache():
+    global _cache
+    _cache.clear()
     return jsonify({"status": "cache cleared"})
 
 
+# Main
 if __name__ == "__main__":
-    # Local dev server
-    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(debug=False, host="0.0.0.0", port=5000, threaded=True)
